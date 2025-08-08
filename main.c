@@ -2,18 +2,10 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <string.h>
+#include <mpi.h>
 
-#define QUEUE_SIZE 10
+#define QUEUE_SIZE 5
 #define CLOCK_SIZE 3
-
-#define RED     "\033[0;31m"
-#define GREEN   "\033[0;32m"
-#define YELLOW  "\033[1;33m"
-#define BLUE    "\033[0;34m"
-#define MAGENTA "\033[0;35m"
-#define CYAN    "\033[0;36m"
-#define RESET   "\033[0m"
 
 typedef struct {
     int vector[CLOCK_SIZE];
@@ -26,105 +18,163 @@ typedef struct {
     VectorClock clock;
 } Message;
 
-Message queue[QUEUE_SIZE];
-int front = 0, rear = 0, count = 0;
+typedef struct {
+    Message messages[QUEUE_SIZE];
+    int front, rear, count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} MessageQueue;
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t cond_not_full = PTHREAD_COND_INITIALIZER;
-pthread_cond_t cond_not_empty = PTHREAD_COND_INITIALIZER;
-
-void enqueue(Message msg) {
-    if (count == QUEUE_SIZE) {
-        printf(MAGENTA "[Fila] Fila cheia!\n" RESET);
-        return;
-    }
-    queue[rear] = msg;
-    rear = (rear + 1) % QUEUE_SIZE;
-    count++;
+void mq_init(MessageQueue* q) {
+    q->front = q->rear = q->count = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
 }
 
-Message dequeue() {
-    if (count == 0) {
-        printf(MAGENTA "[Fila] Fila vazia!\n" RESET);
-        Message empty_msg = {0};
-        return empty_msg;
-    }
-    Message msg = queue[front];
-    front = (front + 1) % QUEUE_SIZE;
-    count--;
+void mq_enqueue(MessageQueue* q, Message msg) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == QUEUE_SIZE)
+        pthread_cond_wait(&q->not_full, &q->mutex);
+
+    q->messages[q->rear] = msg;
+    q->rear = (q->rear + 1) % QUEUE_SIZE;
+    q->count++;
+
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+Message mq_dequeue(MessageQueue* q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->count == 0)
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+
+    Message msg = q->messages[q->front];
+    q->front = (q->front + 1) % QUEUE_SIZE;
+    q->count--;
+
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+
     return msg;
 }
 
-void print_clock(VectorClock clk, int rank) {
-    printf("[Rank %d] Clock: [", rank);
+MessageQueue entrada_relogio_queue;
+MessageQueue relogio_saida_queue;
+
+int rank_global;
+
+void print_clock(VectorClock clk) {
+    printf("[Clock: ");
     for (int i = 0; i < CLOCK_SIZE; i++) {
         printf("%d", clk.vector[i]);
         if (i < CLOCK_SIZE - 1) printf(", ");
     }
-    printf("]\n");
+    printf("]");
 }
 
 void* thread_entrada(void* arg) {
-    int rank = *(int*)arg;
+    int rank = rank_global;
+    int prev = (rank + CLOCK_SIZE - 1) % CLOCK_SIZE;
+    MPI_Status status;
+
     while (1) {
-        sleep(1);
+        Message msg;
+        MPI_Recv(&msg, sizeof(Message), MPI_BYTE, prev, 0, MPI_COMM_WORLD, &status);
 
-        pthread_mutex_lock(&mutex);
+        printf("[Entrada %d] Recebida mensagem de %d com valor %d ", rank, msg.sender, msg.value);
+        print_clock(msg.clock);
+        printf("\n");
 
-        if (count > 0) {
-            Message msg = dequeue();
-            if (msg.receiver == rank) {
-                printf(CYAN "[Thread Entrada %d] Recebida mensagem de %d com valor %d\n" RESET, rank, msg.sender, msg.value);
-
-                // Passar para relógio
-                pthread_mutex_unlock(&mutex);
-                pthread_mutex_lock(&mutex);
-
-                printf(YELLOW "[Thread Relógio %d] Processada mensagem valor %d\n" RESET, rank, msg.value);
-                for (int i = 0; i < CLOCK_SIZE; i++) {
-                    if (i != rank)
-                        msg.clock.vector[i] = (msg.clock.vector[i] > i ? msg.clock.vector[i] : i);
-                }
-                msg.clock.vector[rank]++;
-
-                print_clock(msg.clock, rank);
-
-                pthread_mutex_unlock(&mutex);
-
-                // Enviar para próximo
-                pthread_mutex_lock(&mutex);
-                int next = (rank + 1) % CLOCK_SIZE;
-                msg.sender = rank;
-                msg.receiver = next;
-                enqueue(msg);
-                printf(GREEN "[Thread Saída %d] Enviada mensagem para %d com valor %d\n" RESET, rank, next, msg.value);
-                pthread_mutex_unlock(&mutex);
-            } else {
-                enqueue(msg); // Reenfileira se não for para o rank atual
-            }
-        }
-
-        pthread_mutex_unlock(&mutex);
+        mq_enqueue(&entrada_relogio_queue, msg);
     }
     return NULL;
 }
 
-int main() {
-    pthread_t threads[CLOCK_SIZE];
-    int ranks[CLOCK_SIZE] = {0, 1, 2};
+void* thread_relogio(void* arg) {
+    int rank = rank_global;
 
-    // Inicializar fila com primeira mensagem
-    VectorClock initial_clock = {{1, 0, 0}};
-    Message initial_msg = {0, 1, 100, initial_clock};
-    enqueue(initial_msg);
+    while (1) {
+        Message msg = mq_dequeue(&entrada_relogio_queue);
 
-    for (int i = 0; i < CLOCK_SIZE; i++) {
-        pthread_create(&threads[i], NULL, thread_entrada, &ranks[i]);
+        for (int i = 0; i < CLOCK_SIZE; i++) {
+            if (msg.clock.vector[i] < 0)
+                msg.clock.vector[i] = 0;
+        }
+        msg.clock.vector[rank]++;
+
+        printf("[Relógio %d] Atualizou mensagem com valor %d ", rank, msg.value);
+        print_clock(msg.clock);
+        printf("\n");
+
+        msg.sender = rank;
+        msg.receiver = (rank + 1) % CLOCK_SIZE;
+
+        mq_enqueue(&relogio_saida_queue, msg);
+    }
+    return NULL;
+}
+
+void* thread_saida(void* arg) {
+    int rank = rank_global;
+    int next = (rank + 1) % CLOCK_SIZE;
+
+    while (1) {
+        Message msg = mq_dequeue(&relogio_saida_queue);
+
+        printf("[Saída %d] Enviando mensagem para %d com valor %d ", rank, next, msg.value);
+        print_clock(msg.clock);
+        printf("\n");
+
+        MPI_Send(&msg, sizeof(Message), MPI_BYTE, next, 0, MPI_COMM_WORLD);
+
+        usleep(200000);
+    }
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank_global);
+    MPI_Comm_size(MPI_COMM_WORLD, &argc);
+
+    if (argc != CLOCK_SIZE) {
+        if (rank_global == 0) {
+            printf("Execute o programa com %d processos.\n", CLOCK_SIZE);
+        }
+        MPI_Finalize();
+        return 1;
     }
 
-    for (int i = 0; i < CLOCK_SIZE; i++) {
-        pthread_join(threads[i], NULL);
+    mq_init(&entrada_relogio_queue);
+    mq_init(&relogio_saida_queue);
+
+    pthread_t t_entrada, t_relogio, t_saida;
+
+    if (rank_global == 0) {
+        Message initial_msg;
+        initial_msg.sender = 0;
+        initial_msg.receiver = 1;
+        initial_msg.value = 1;
+        for (int i = 0; i < CLOCK_SIZE; i++)
+            initial_msg.clock.vector[i] = 0;
+        initial_msg.clock.vector[0] = 1;
+
+        MPI_Send(&initial_msg, sizeof(Message), MPI_BYTE, 1, 0, MPI_COMM_WORLD);
+        printf("[Main %d] Enviada mensagem inicial para 1\n", rank_global);
     }
 
+    pthread_create(&t_entrada, NULL, thread_entrada, NULL);
+    pthread_create(&t_relogio, NULL, thread_relogio, NULL);
+    pthread_create(&t_saida, NULL, thread_saida, NULL);
+
+    pthread_join(t_entrada, NULL);
+    pthread_join(t_relogio, NULL);
+    pthread_join(t_saida, NULL);
+
+    MPI_Finalize();
     return 0;
 }
