@@ -93,6 +93,7 @@ void* thread_entrada(void* arg) {
     return NULL;
 }
 
+// alterar essa funcao para ficar igual a etapa um, no send ela manda para a saida e no recv ele recebe de qlqr um em qlqr ordem
 void* thread_relogio(void* arg) {
     int rank = rank_global;
 
