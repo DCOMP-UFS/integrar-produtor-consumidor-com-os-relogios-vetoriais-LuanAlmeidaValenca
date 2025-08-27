@@ -98,23 +98,32 @@ void* thread_relogio(void* arg) {
     int rank = rank_global;
 
     while (1) {
-        Message msg = mq_dequeue(&entrada_relogio_queue);
+
+        Message msg_in = mq_dequeue(&entrada_relogio_queue);
 
         for (int i = 0; i < CLOCK_SIZE; i++) {
-            if (msg.clock.vector[i] < 0)
-                msg.clock.vector[i] = 0;
+            if (msg_in.clock.vector[i] > msg_in.clock.vector[rank]) {
+                msg_in.clock.vector[rank] = msg_in.clock.vector[i];
+            }
         }
-        msg.clock.vector[rank]++;
 
-        printf("[Relógio %d] Atualizou mensagem com valor %d ", rank, msg.value);
-        print_clock(msg.clock);
+        msg_in.clock.vector[rank]++;
+
+        printf("[Relógio %d] Processada mensagem de %d com valor %d ",
+               rank, msg_in.sender, msg_in.value);
+        print_clock(msg_in.clock);
         printf("\n");
 
-        msg.sender = rank;
-        msg.receiver = (rank + 1) % CLOCK_SIZE;
+        Message msg_out;
+        msg_out.sender   = rank;
+        msg_out.value    = msg_in.value + 1;
+        msg_out.clock    = msg_in.clock;
 
-        mq_enqueue(&relogio_saida_queue, msg);
+        msg_out.receiver = -1;  
+
+        mq_enqueue(&relogio_saida_queue, msg_out);
     }
+
     return NULL;
 }
 
